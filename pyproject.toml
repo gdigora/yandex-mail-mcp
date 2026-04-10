@@ -1,0 +1,86 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "yandex-mail-mcp"
+version = "0.1.2"
+description = "MCP (Model Context Protocol) server for Yandex Mail via IMAP/SMTP — 28 email tools including search, read, send, reply, forward, bulk operations, and folder management"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["mcp", "yandex", "mail", "imap", "smtp", "email", "claude"]
+authors = [
+    { name = "imdeniil" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Email",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp>=1.0",
+    "python-dotenv>=1.0",
+    "imapclient>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/imdeniil/yandex-mail-mcp"
+Repository = "https://github.com/imdeniil/yandex-mail-mcp"
+Issues = "https://github.com/imdeniil/yandex-mail-mcp/issues"
+Changelog = "https://github.com/imdeniil/yandex-mail-mcp/blob/main/CHANGELOG.md"
+
+[project.scripts]
+yandex-mail-mcp = "yandex_mail_mcp:main"
+
+# --- hatchling build configuration ---------------------------------------
+
+[tool.hatch.build.targets.wheel]
+# Single-file module, not a package
+only-include = ["yandex_mail_mcp.py"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "yandex_mail_mcp.py",
+    "README.md",
+    "CHANGELOG.md",
+    "CLAUDE.md",
+    "CLAUDE_DESKTOP.md",
+    "LICENSE",
+    ".env.example",
+    "pyproject.toml",
+]
+exclude = [
+    ".venv",
+    ".git",
+    "__pycache__",
+    "*.pyc",
+    "yandex_mail_mcp.log",
+    ".env",
+    "test_server.py",
+    "test_helpers.py",
+    "test_integration.py",
+    "conftest.py",
+    ".claude",
+    ".tldr",
+    ".tldrignore",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

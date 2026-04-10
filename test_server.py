@@ -6,7 +6,7 @@ Requires valid credentials in .env file.
 """
 
 import pytest
-from server import (
+from yandex_mail_mcp import (
     list_folders,
     search_emails,
     read_email,

@@ -5,3 +5,15 @@ __pycache__/
 *.log
 .pytest_cache/
 .DS_Store
+
+# Build / tooling
+dist/
+build/
+*.egg-info/
+uv.lock
+
+# Local caches from Claude Code setup
+.claude/cache/
+.claude/tsc-cache/
+.tldr/
+.tldrignore
