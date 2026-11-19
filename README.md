@@ -15,7 +15,7 @@ MCP (Model Context Protocol) server for Yandex Mail. Enables Claude Desktop and 
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/yandex-mail-mcp.git
+git clone https://github.com/gdigora/yandex-mail-mcp.git
 cd yandex-mail-mcp
 
 # Create virtual environment
@@ -29,6 +29,24 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your Yandex email and app password
 ```
+
+## Security Model
+
+This server gives the connected MCP client (your LLM host, e.g. Claude Desktop) **full
+authority over one mailbox** — read, search, move, delete, and send as you — and lets it
+write downloaded attachments to local directories. Keep in mind:
+
+- **Enable tool approval in your MCP client** and do not set "Always allow" for
+  `send_email`, `delete_email`, `move_email`, or `download_attachment`: emails from
+  unauthenticated senders can contain instructions aimed at the model
+  (indirect prompt injection). Every tool result from this server is labeled
+  `provenance: "untrusted_remote"` for that reason.
+- Credentials live only in the local `.env` file (gitignored) and are transmitted over
+  TLS with full certificate and hostname verification.
+- Attachment downloads are confined to the target directory (traversal and symlink
+  escapes are rejected), and destructive operations are fail-safe: a failed move to
+  Trash raises instead of permanently deleting, and expunging is scoped so other
+  pending-deleted messages in the folder are never swept.
 
 ## Yandex Setup
 
@@ -80,11 +98,16 @@ UNSEEN FROM boss@company.com # Combined query
 
 ## Running Tests
 
+Offline regression tests (no network, no credentials needed — stubbed IMAP):
+
 ```bash
 source .venv/bin/activate
-pytest test_server.py -v
+pytest test_security_fixes.py test_correctness_fixes.py -v
 ```
+
+`test_server.py` contains integration tests against a live Yandex mailbox and requires
+valid credentials in `.env` (may fail due to Yandex rate limiting).
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
