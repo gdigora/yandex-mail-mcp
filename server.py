@@ -45,7 +45,7 @@ EmailFull = TypedDict("EmailFull", {
     "attachments": list, "provenance": str,
 })
 SendResult = TypedDict("SendResult", {
-    "status": str, "to": str, "subject": str, "cc": str, "bcc": str,
+    "status": str, "to": str, "subject": str, "cc": Optional[str], "bcc": Optional[str],
 })
 DownloadResult = TypedDict("DownloadResult", {
     "status": str, "filename": str, "path": str, "size": int, "content_type": str,
