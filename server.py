@@ -16,6 +16,7 @@ import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
+from email.utils import parseaddr, make_msgid, formatdate
 import os
 import logging
 from pathlib import Path
@@ -53,6 +54,9 @@ MoveResult = TypedDict("MoveResult", {
 })
 DeleteResult = TypedDict("DeleteResult", {
     "status": str, "email_id": str, "folder": str, "trash_folder": str,
+})
+DraftResult = TypedDict("DraftResult", {
+    "status": str, "draft_folder": str, "uid": Optional[str],
 })
 
 # Load environment variables from script's directory
@@ -857,6 +861,157 @@ def delete_email(folder: str, email_id: str) -> DeleteResult:
             "folder": folder,
             "trash_folder": trash_folder
         }
+
+
+def _append_draft(conn, msg) -> dict:
+    """APPEND a composed message into the mailbox's \\Drafts folder.
+
+    Draft-first workflow: the agent composes, the human reviews and sends
+    from their own client - the server never needs direct send authority
+    for the drafting step. Returns the DraftResult payload; the new draft's
+    UID is extracted from the UIDPLUS APPENDUID response when available.
+    """
+    drafts_folder = _find_folder_by_flag(conn, "\\Drafts")
+    if drafts_folder is None:
+        raise Exception("Drafts folder not found (no \\Drafts attribute)")
+
+    status, data = conn.append(drafts_folder, "\\Draft", None, msg.as_bytes())
+    if status != "OK":
+        raise Exception(f"Failed to append draft to {drafts_folder}")
+
+    uid = None
+    for item in data or ():
+        raw = item if isinstance(item, bytes) else str(item).encode()
+        match = re.search(rb"APPENDUID \d+ (\d+)", raw)
+        if match:
+            uid = match.group(1).decode()
+            break
+
+    return {
+        "status": "draft_created",
+        "draft_folder": drafts_folder,
+        "uid": uid
+    }
+
+
+@mcp.tool()
+@tool_with_resilience
+def create_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+    html: bool = False
+) -> DraftResult:
+    """
+    Save an email as a draft in the mailbox's Drafts folder.
+
+    Draft-first workflow: the draft appears in your mail client for review;
+    you send it yourself. The message is not transmitted to any recipient.
+
+    Args:
+        to: Recipient email address (comma-separated for multiple)
+        subject: Email subject
+        body: Email body (plain text or HTML based on html flag)
+        cc: CC recipients (optional, comma-separated)
+        bcc: BCC recipients (optional, comma-separated)
+        html: If True, body is treated as HTML (default: False)
+
+    Returns confirmation with the draft folder and UID.
+    """
+    if html:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(body, "html", "utf-8"))
+    else:
+        msg = MIMEText(body, "plain", "utf-8")
+
+    msg["Subject"] = subject
+    msg["From"] = EMAIL
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
+    msg["Date"] = formatdate()
+    msg["Message-ID"] = make_msgid(domain=EMAIL.split("@", 1)[1])
+
+    with imap_connection() as conn:
+        return _append_draft(conn, msg)
+
+
+@mcp.tool()
+@tool_with_resilience
+def reply_email(folder: str, email_id: str, body: str) -> DraftResult:
+    """
+    Save a reply to an existing email as a draft.
+
+    Reply headers (recipient, Re: subject, In-Reply-To/References) are
+    derived from the original email by code, so the reply lands in the
+    same conversation; the draft appears in your Drafts folder for review
+    before sending. The message is not transmitted to any recipient.
+
+    Args:
+        folder: Folder containing the email being replied to
+        email_id: Email UID to reply to
+        body: Reply text; the original message is quoted below it
+
+    Returns confirmation with the draft folder and UID.
+    """
+    uid = _require_uid(email_id)
+    with imap_connection() as conn:
+        status, _ = conn.select(folder, readonly=True)
+        if status != "OK":
+            raise Exception(f"Failed to select folder: {folder}")
+
+        status, msg_data = conn.uid("FETCH", uid, "(RFC822)")
+        if status != "OK":
+            raise Exception(f"Failed to fetch email: {email_id}")
+
+        original = email.message_from_bytes(msg_data[0][1])
+        subject = decode_mime_header(original.get("Subject", ""))
+        if not subject.lower().startswith("re"):
+            subject = "Re: " + subject
+
+        # Recipient: Reply-To when present, otherwise the original sender.
+        # compat32 message_from_bytes does not decode RFC2047 encoded-words,
+        # so the header must be decoded before parseaddr - otherwise a
+        # Cyrillic display name (encoded-word) becomes the "address".
+        reply_source = decode_mime_header(original.get("Reply-To") or original.get("From", ""))
+        reply_to = parseaddr(reply_source)[1]
+        if not reply_to:
+            raise Exception("Original email has no identifiable sender to reply to")
+
+        message_id = (original.get("Message-ID") or "").strip()
+        references = (original.get("References") or "").strip()
+        if message_id:
+            references = f"{references} {message_id}".strip()
+
+        # Quote the original text body (first non-attachment text/plain part)
+        orig_text = ""
+        if original.is_multipart():
+            for part in original.walk():
+                if (part.get_content_type() == "text/plain"
+                        and "attachment" not in str(part.get("Content-Disposition", ""))):
+                    orig_text = decode_body(
+                        part.get_payload(decode=True), part.get_content_charset() or "utf-8")
+                    break
+        else:
+            orig_text = decode_body(
+                original.get_payload(decode=True), original.get_content_charset() or "utf-8")
+        quoted = "\n".join("> " + line for line in orig_text.splitlines())
+        full_body = f"{body}\n\n{quoted}" if quoted else body
+
+        msg = MIMEText(full_body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = EMAIL
+        msg["To"] = reply_to
+        msg["Date"] = formatdate()
+        msg["Message-ID"] = make_msgid(domain=EMAIL.split("@", 1)[1])
+        if message_id:
+            msg["In-Reply-To"] = message_id
+            if references:
+                msg["References"] = references
+
+        return _append_draft(conn, msg)
 
 
 if __name__ == "__main__":
