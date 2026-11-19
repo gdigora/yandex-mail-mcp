@@ -9,6 +9,9 @@ fixtures are synthetic. They cover the five confirmed audit findings:
   F-3  delete_email: failed Trash copy must NOT escalate to permanent deletion
   F-4  unscoped EXPUNGE: other pending-deleted messages must not be swept
   F-5  read_email: attacker-chosen body charset must not crash the tool
+
+Note: since fix/correctness-p1 the tools operate on UIDs (see
+test_correctness_fixes.py); the stub therefore implements conn.uid(...).
 """
 
 import email.mime.multipart
@@ -27,7 +30,10 @@ import server
 # ---------------------------------------------------------------------------
 
 class FakeIMAP:
-    """Minimal imaplib-shaped stub implementing only what the tools call."""
+    """Minimal imaplib-shaped stub implementing only what the tools call.
+
+    Tools use UID commands (uid SEARCH/FETCH/COPY/STORE) and plain select/expunge.
+    """
 
     def __init__(self, copy_status="OK", deleted_ids=None, messages=None):
         self.copy_status = copy_status
@@ -42,27 +48,29 @@ class FakeIMAP:
         self.readonly = readonly
         return ("OK", [b"1 EXISTS"])
 
-    def copy(self, msg_id, destination):
-        self.copied = (msg_id, destination)
-        return (self.copy_status, None)
-
-    def store(self, msg_id, operation, flags):
-        self.stored = (msg_id, operation, flags)
-        return ("OK", None)
-
-    def search(self, charset, *criteria):
-        assert criteria == ("DELETED",), f"unexpected search: {criteria}"
-        return ("OK", [" ".join(self.deleted_ids).encode()])
-
     def expunge(self):
         self.expunged = True
         return ("OK", [b"1"])
 
-    def fetch(self, msg_id, what):
-        raw = self.messages.get(msg_id.decode())
-        if raw is None:
-            return ("OK", [(None, b"")])
-        return ("OK", [(None, raw)])
+    def uid(self, command, *args):
+        cmd = command.upper()
+        if cmd == "SEARCH":
+            criteria = args[1:] if args and args[0] == "CHARSET" else args
+            assert criteria == ("DELETED",), f"unexpected search: {criteria}"
+            return ("OK", [" ".join(self.deleted_ids).encode()])
+        if cmd == "COPY":
+            self.copied = (args[0], args[1])
+            return (self.copy_status, None)
+        if cmd == "STORE":
+            self.stored = (args[0], args[1], args[2])
+            return ("OK", None)
+        if cmd == "FETCH":
+            uid_arg = args[0]
+            if isinstance(uid_arg, (bytes, bytearray)):
+                uid_arg = uid_arg.decode()
+            raw = self.messages.get(uid_arg)
+            return ("OK", [(None, raw)] if raw is not None else ("OK", [(None, b"")]))
+        raise AssertionError(f"unexpected uid command: {cmd}")
 
 
 def make_stubbed_connection(conn):
@@ -110,19 +118,14 @@ class TestTlsContext:
 # F-2: download_attachment containment
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def inbox_with_attachment():
-    conn = FakeIMAP(messages={"1": make_attachment_email("../victim.txt")})
-    conn.messages["1"] = make_attachment_email("../victim.txt")
-    return conn
-
-
-def test_download_normalizes_traversal_name_into_save_dir(monkeypatch, tmp_path, inbox_with_attachment):
+def test_download_normalizes_traversal_name_into_save_dir(monkeypatch, tmp_path):
     save_dir = tmp_path / "downloads"
     save_dir.mkdir()
     (tmp_path / "victim.txt").write_text("ORIGINAL-CONTENT")
 
-    monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(inbox_with_attachment))
+    conn = FakeIMAP(messages={"1": make_attachment_email("../victim.txt")})
+    monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+
     result = server.download_attachment("INBOX", "1", "../victim.txt", str(save_dir))
 
     # The write landed inside the declared save dir (name reduced to a basename)
@@ -183,7 +186,7 @@ def test_delete_without_trash_folder_raises_and_keeps_message(monkeypatch):
     with pytest.raises(Exception, match="Could not move email to Trash"):
         server.delete_email("INBOX", "1")
     assert conn.expunged is False
-    assert conn.copied == (b"1", "Trash")
+    assert conn.copied == ("1", "Trash")
 
 
 def test_delete_success_path_expunges_only_requested_message(monkeypatch):
