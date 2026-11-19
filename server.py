@@ -5,11 +5,14 @@ Provides email tools for Claude Desktop via MCP protocol.
 Uses IMAP for reading and SMTP for sending.
 """
 
+import functools
 import imaplib
 import smtplib
 import email
+import json
 import re
 import ssl
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
@@ -19,12 +22,40 @@ import sys
 import logging
 from pathlib import Path
 from contextlib import contextmanager
-from typing import Optional
+from typing import Optional, TypedDict
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from imapclient import imap_utf7
 
 VERSION = "0.0.1"
+
+# Structured-output annotations (mcp >= 1.10 emits a single compact
+# structuredContent JSON per call instead of one text block per list item).
+# Functional TypedDict syntax: "from" is a Python keyword.
+FolderInfo = TypedDict("FolderInfo", {"name": str, "imap_name": str})
+EmailSummary = TypedDict("EmailSummary", {
+    "id": str, "subject": str, "from": str, "date": str, "provenance": str,
+})
+AttachmentInfo = TypedDict("AttachmentInfo", {
+    "filename": str, "content_type": str, "size": int,
+})
+EmailFull = TypedDict("EmailFull", {
+    "id": str, "subject": str, "from": str, "to": str, "date": str,
+    "body_text": str, "body_html": str,
+    "attachments": list, "provenance": str,
+})
+SendResult = TypedDict("SendResult", {
+    "status": str, "to": str, "subject": str, "cc": str, "bcc": str,
+})
+DownloadResult = TypedDict("DownloadResult", {
+    "status": str, "filename": str, "path": str, "size": int, "content_type": str,
+})
+MoveResult = TypedDict("MoveResult", {
+    "status": str, "email_id": str, "from_folder": str, "to_folder": str,
+})
+DeleteResult = TypedDict("DeleteResult", {
+    "status": str, "email_id": str, "folder": str, "trash_folder": str,
+})
 
 # Load environment variables from script's directory
 SCRIPT_DIR = Path(__file__).parent.resolve()
@@ -210,8 +241,81 @@ def parse_mailbox_list_item(line: str):
     return imap_name, decode_folder_name(imap_name)
 
 
+# Transient connection failures worth a single retry (Yandex occasionally
+# drops a session mid-command; observed live: "EXAMINE => problems with
+# connection", cleared on retry).
+_TRANSIENT_EXCEPTIONS = (
+    imaplib.IMAP4.abort,          # connection dropped/aborted
+    smtplib.SMTPServerDisconnected,
+    ConnectionError,
+    TimeoutError,
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    if isinstance(exc, _TRANSIENT_EXCEPTIONS):
+        return True
+    text = str(exc).lower()
+    return (
+        "problems with connection" in text
+        or "connection reset" in text
+        or "timed out" in text
+        or "server disconnected" in text
+    )
+
+
+_LOG_ARG_LIMIT = 120
+
+
+def _sanitize_log_args(fn, args, kwargs) -> dict:
+    """Tool args for the log: body omitted (email content must not be written
+    to disk logs), everything else truncated."""
+    params = list(fn.__code__.co_varnames[: fn.__code__.co_argcount])
+    merged = dict(zip(params, args))
+    merged.update(kwargs)
+    safe = {}
+    for key, value in merged.items():
+        if key == "body":
+            safe[key] = f"<{len(str(value))} chars omitted>"
+            continue
+        text = str(value)
+        safe[key] = text[:_LOG_ARG_LIMIT] + ("…" if len(text) > _LOG_ARG_LIMIT else "")
+    return safe
+
+
+def tool_with_resilience(fn):
+    """Audit-log every tool invocation and retry once on transient failures.
+
+    The log line is the only audit trail of tool usage (stdout is reserved
+    for the MCP protocol); email bodies are never written to it.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            logger.info(
+                "tool=%s args=%s",
+                fn.__name__,
+                json.dumps(_sanitize_log_args(fn, args, kwargs), ensure_ascii=False),
+            )
+        except Exception:  # logging must never break a tool call
+            pass
+        for attempt in range(2):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as exc:
+                if attempt == 0 and _is_transient(exc):
+                    logger.warning(
+                        "transient failure in %s, retrying once: %s", fn.__name__, exc
+                    )
+                    time.sleep(1.0)
+                    continue
+                raise
+    return wrapper
+
+
 @mcp.tool()
-def list_folders() -> list[dict]:
+@tool_with_resilience
+def list_folders() -> list[FolderInfo]:
     """
     List all mail folders in the Yandex mailbox.
 
@@ -309,11 +413,12 @@ def build_imap_search_criteria(query: str) -> list[str]:
 
 
 @mcp.tool()
+@tool_with_resilience
 def search_emails(
     folder: str = "INBOX",
     query: str = "ALL",
     limit: int = 20
-) -> list[dict]:
+) -> list[EmailSummary]:
     """
     Search emails in a folder.
 
@@ -391,7 +496,7 @@ def search_emails(
 
 
 @mcp.tool()
-def read_email(folder: str, email_id: str) -> dict:
+def read_email(folder: str, email_id: str) -> EmailFull:
     """
     Read full email content by ID.
 
@@ -466,12 +571,13 @@ def read_email(folder: str, email_id: str) -> dict:
 
 
 @mcp.tool()
+@tool_with_resilience
 def download_attachment(
     folder: str,
     email_id: str,
     filename: str,
     save_dir: Optional[str] = None
-) -> dict:
+) -> DownloadResult:
     """
     Download an email attachment to disk.
 
@@ -544,6 +650,7 @@ def download_attachment(
 
 
 @mcp.tool()
+@tool_with_resilience
 def send_email(
     to: str,
     subject: str,
@@ -551,7 +658,7 @@ def send_email(
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
     html: bool = False
-) -> dict:
+) -> SendResult:
     """
     Send an email via Yandex SMTP.
 
@@ -600,7 +707,7 @@ def send_email(
 
 
 @mcp.tool()
-def move_email(folder: str, email_id: str, destination: str) -> dict:
+def move_email(folder: str, email_id: str, destination: str) -> MoveResult:
     """
     Move an email to another folder.
 
@@ -663,7 +770,7 @@ def move_email(folder: str, email_id: str, destination: str) -> dict:
 
 
 @mcp.tool()
-def delete_email(folder: str, email_id: str) -> dict:
+def delete_email(folder: str, email_id: str) -> DeleteResult:
     """
     Delete an email (move to Trash).
 
