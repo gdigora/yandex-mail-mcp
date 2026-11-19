@@ -205,6 +205,85 @@ class TestDraftResultSchema:
             assert hasattr(getattr(server, tool), "__wrapped__"), f"{tool} misses resilience"
 
 
+class TestDraftHeaderSafety:
+    """Remote content and model args must not reach a draft's header block:
+    the human will send that draft, so injected headers would go out with it.
+    (Found by a live-review probe: 'Bcc: attacker@evil.test' embedded in a
+    remote Message-ID landed in the draft bytes verbatim.)"""
+
+    def test_create_draft_rejects_crlf_in_header_args(self, monkeypatch):
+        conn = FakeDraftIMAP()
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+        with pytest.raises(ValueError, match="must not contain line breaks"):
+            server.create_draft(to="x@y.z", subject="s\nBcc: attacker@evil.test", body="b")
+        with pytest.raises(ValueError, match="must not contain line breaks"):
+            server.create_draft(to="x@y.z\n Bcc: attacker@evil.test", subject="s", body="b")
+        with pytest.raises(ValueError, match="must not contain line breaks"):
+            server.create_draft(to="x@y.z", subject="s", body="b", cc="a@b.c\n d@e.f")
+        assert conn.appends == []  # nothing stored
+
+    def test_reply_email_drops_injected_message_id(self, monkeypatch):
+        m = email.mime.text.MIMEText("body", "plain", "utf-8")
+        m["Subject"] = "s"
+        m["From"] = "attacker@example.test"
+        m["Message-ID"] = "<abc@example.test>\n Bcc: attacker@evil.test"
+        conn = FakeDraftIMAP(messages={"42": m.as_bytes()})
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+
+        server.reply_email("INBOX", "42", "ответ")
+        msg = message_from_bytes(conn.appends[0]["message"])
+        assert msg["In-Reply-To"] is None
+        raw = conn.appends[0]["message"].decode(errors="replace")
+        assert "Bcc" not in raw and "attacker@evil.test" not in raw
+
+    def test_reply_email_sanitizes_references(self, monkeypatch):
+        m = email.mime.text.MIMEText("body", "plain", "utf-8")
+        m["Subject"] = "s"
+        m["From"] = "attacker@example.test"
+        m["Message-ID"] = "<m1@example.test>"
+        m["References"] = "<r1@example.test>\n X-Evil: yes"
+        conn = FakeDraftIMAP(messages={"42": m.as_bytes()})
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+
+        server.reply_email("INBOX", "42", "ответ")
+        msg = message_from_bytes(conn.appends[0]["message"])
+        assert msg["References"] == "<r1@example.test> <m1@example.test>"
+        raw = conn.appends[0]["message"].decode(errors="replace")
+        assert "X-Evil" not in raw
+
+    def test_reply_email_subject_line_breaks_sanitized(self, monkeypatch):
+        folded = email.mime.text.MIMEText("body", "plain", "utf-8")
+        folded["Subject"] = "line one\n line two"
+        folded["From"] = "x@example.test"
+        conn = FakeDraftIMAP(messages={"42": folded.as_bytes()})
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+
+        server.reply_email("INBOX", "42", "ответ")
+        msg = message_from_bytes(conn.appends[0]["message"])
+        raw = conn.appends[0]["message"].decode(errors="replace")
+        assert "\n line two" not in raw
+
+    def test_create_draft_stores_bcc(self, monkeypatch):
+        conn = FakeDraftIMAP()
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+        server.create_draft(to="x@example.test", subject="s", body="b", bcc="secret@evil.test")
+        msg = message_from_bytes(conn.appends[0]["message"])
+        assert msg["Bcc"] == "secret@evil.test"  # client strips it on send
+
+    def test_missing_email_clean_valueerror(self, monkeypatch):
+        saved = server.EMAIL
+        try:
+            server.EMAIL = None
+            conn = FakeDraftIMAP()
+            monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+            with pytest.raises(ValueError, match="YANDEX_EMAIL must be set"):
+                server.create_draft(to="x@y.z", subject="s", body="b")
+            with pytest.raises(ValueError, match="YANDEX_EMAIL must be set"):
+                server.reply_email("INBOX", "1", "b")
+        finally:
+            server.EMAIL = saved
+
+
 class TestFetchGuards:
     """A nonexistent/vanished UID must raise a clean "not found" error
     instead of crashing on NoneType subscript (found live)."""

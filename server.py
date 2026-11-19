@@ -868,6 +868,32 @@ def _fetch_raw_email(conn, uid: str, folder: str) -> bytes:
     return msg_data[0][1]
 
 
+def _clean_header(value: str, field: str) -> str:
+    """Reject line breaks in a header-bound value.
+
+    Direct CRLF fails closed in compat32 anyway (HeaderParseError), but the
+    folded variant (newline + leading whitespace) passes and lands in the
+    stored header value - remote content must never reach a draft's header
+    block, because the human will send that draft.
+    """
+    if "\r" in value or "\n" in value:
+        raise ValueError(f"{field} must not contain line breaks")
+    return value
+
+
+def _sanitize_msg_id_token(token: str) -> Optional[str]:
+    """Validate a single msg-id token for In-Reply-To/References.
+
+    Only `<...>` tokens without whitespace, angle brackets or line breaks are
+    kept - a remote Message-ID/References header must not carry anything else
+    into a draft's header block.
+    """
+    token = re.sub(r"[\r\n\s]+", " ", token).strip()
+    if token and re.fullmatch(r"<[^<>\s]+>", token):
+        return token
+    return None
+
+
 def _append_draft(conn, msg) -> dict:
     """APPEND a composed message into the mailbox's \\Drafts folder.
 
@@ -925,6 +951,16 @@ def create_draft(
 
     Returns confirmation with the draft folder and UID.
     """
+    if not EMAIL:
+        raise ValueError("YANDEX_EMAIL must be set in .env")
+
+    _clean_header(to, "to")
+    _clean_header(subject, "subject")
+    if cc:
+        _clean_header(cc, "cc")
+    if bcc:
+        _clean_header(bcc, "bcc")
+
     if html:
         msg = MIMEMultipart("alternative")
         msg.attach(MIMEText(body, "html", "utf-8"))
@@ -936,6 +972,10 @@ def create_draft(
     msg["To"] = to
     if cc:
         msg["Cc"] = cc
+    if bcc:
+        # Drafts store Bcc as a header; the user's mail client strips it on
+        # send. Silently dropping it would lose the recipients (review probe E)
+        msg["Bcc"] = bcc
     msg["Date"] = formatdate()
     msg["Message-ID"] = make_msgid(domain=EMAIL.split("@", 1)[1])
 
@@ -962,13 +1002,17 @@ def reply_email(folder: str, email_id: str, body: str) -> DraftResult:
     Returns confirmation with the draft folder and UID.
     """
     uid = _require_uid(email_id)
+    if not EMAIL:
+        raise ValueError("YANDEX_EMAIL must be set in .env")
     with imap_connection() as conn:
         status, _ = conn.select(folder, readonly=True)
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
         original = email.message_from_bytes(_fetch_raw_email(conn, uid, folder))
-        subject = decode_mime_header(original.get("Subject", ""))
+        # A folded Subject is legitimate RFC5322 folding in the original;
+        # collapse it instead of rejecting (rejection is for model args)
+        subject = " ".join(decode_mime_header(original.get("Subject", "")).split())
         if not subject.lower().startswith("re"):
             subject = "Re: " + subject
 
@@ -983,8 +1027,16 @@ def reply_email(folder: str, email_id: str, body: str) -> DraftResult:
 
         message_id = (original.get("Message-ID") or "").strip()
         references = (original.get("References") or "").strip()
+        # Remote-controlled headers: keep only well-formed msg-id tokens,
+        # never pass embedded line breaks into the draft's header block
+        message_id = _sanitize_msg_id_token(message_id)
+        ref_tokens = [
+            t for t in (_sanitize_msg_id_token(x) for x in references.split())
+            if t is not None
+        ]
         if message_id:
-            references = f"{references} {message_id}".strip()
+            ref_tokens.append(message_id)
+        references = " ".join(ref_tokens) or None
 
         # Quote the original text body (first non-attachment text/plain part)
         orig_text = ""
