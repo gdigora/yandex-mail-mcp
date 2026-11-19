@@ -187,6 +187,68 @@ class TestReplyEmail:
         assert len(conn.appends) == 1 and len(getattr(conn, "moves", []) or []) == 0
 
 
+class TestSelectorValidation:
+    """The durable NV-2 fix: mailbox selectors and search tokens are
+    validated repo-side, so IMAP command framing never depends on the
+    stdlib version (spaces/quotes/UTF-7 in legitimate names stay valid)."""
+
+    def test_control_characters_rejected_before_any_command(self, monkeypatch):
+        conn = FakeDraftIMAP()
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+        bad_names = ["INBOX\r\nx CREATE Junk", "INBOX\x00junk", "\x1fINBOX", "INBOX\n Bcc: a@b.c"]
+        for bad in bad_names:
+            with pytest.raises(ValueError, match="must not contain control characters"):
+                server.search_emails(bad, "ALL", 5)
+            with pytest.raises(ValueError, match="must not contain control characters"):
+                server.read_email(bad, "42")
+            with pytest.raises(ValueError, match="must not contain control characters"):
+                server.delete_email(bad, "1")
+            with pytest.raises(ValueError, match="must not contain control characters"):
+                server.move_email("INBOX", "1", bad)
+            with pytest.raises(ValueError, match="must not contain control characters"):
+                server.reply_email(bad, "42", "ответ")
+            with pytest.raises(ValueError, match="must not contain control characters"):
+                server.download_attachment(bad, "42", "f.txt", "/tmp")
+        assert conn.appends == [] and conn.selected is None  # nothing ran
+
+    def test_empty_and_oversized_names_rejected(self, monkeypatch):
+        conn = FakeDraftIMAP()
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+        with pytest.raises(ValueError, match="non-empty mailbox name"):
+            server.delete_email("   ", "1")
+        with pytest.raises(ValueError, match="too long"):
+            server.delete_email("I" * 900, "1")
+
+    def test_legit_complex_names_pass(self, monkeypatch):
+        class SearchStub:
+            def select(self, folder, readonly=False):
+                return ("OK", [b"1 EXISTS"])
+
+            def uid(self, command, *args):
+                if command.upper() == "SEARCH":
+                    return ("OK", [b"7"])
+                if command.upper() == "FETCH":
+                    return ("OK", [(None, ORIGINAL_BYTES)])
+                raise AssertionError(command)
+
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(SearchStub()))
+        # spaces, |, &, UTF-7 — all legitimate
+        emails = server.search_emails("&BB8EOARBBEwEPAQw- &BD4EQg- Avito.ru", "ALL", 5)
+        assert emails[0]["id"] == "7"
+
+    def test_search_rejects_control_characters_in_tokens(self):
+        with pytest.raises(ValueError, match="Invalid character"):
+            server.build_imap_search_criteria("FROM x@y.z\x00 OR UNSEEN")
+        with pytest.raises(ValueError, match="Invalid character"):
+            server.build_imap_search_criteria("SUBJECT ok\x00value")
+        with pytest.raises(ValueError, match="Invalid character"):
+            server.build_imap_search_criteria("\x01 OR ALL")
+        # normal complex queries keep working
+        assert server.build_imap_search_criteria("SUBJECT важный отчет SINCE 01-Dec-2024") == [
+            "SUBJECT", '"важный отчет"', "SINCE", "01-Dec-2024",
+        ]
+
+
 class TestDraftResultSchema:
     def test_conformance_with_uid(self):
         from pydantic import TypeAdapter
