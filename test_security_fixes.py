@@ -32,14 +32,24 @@ import server
 class FakeIMAP:
     """Minimal imaplib-shaped stub implementing only what the tools call.
 
-    Tools use UID commands (uid SEARCH/FETCH/COPY/STORE) and plain select/expunge.
+    Tools use UID commands (uid SEARCH/FETCH/COPY/STORE/MOVE/EXPUNGE), plain
+    select/expunge, and LIST (for \\Trash discovery). The default mailbox set
+    advertises a \\Trash folder and UIDPLUS+MOVE capabilities like Yandex.
     """
 
-    def __init__(self, copy_status="OK", deleted_ids=None, messages=None):
+    def __init__(self, copy_status="OK", deleted_ids=None, messages=None,
+                 capabilities=("UIDPLUS", "MOVE"),
+                 trash_line=b'(\\HasNoChildren \\Trash) NIL "Trash"',
+                 move_status="OK"):
         self.copy_status = copy_status
         self.deleted_ids = list(deleted_ids or [])
         self.messages = dict(messages or {})
+        self.capabilities = tuple(capabilities)
+        self.trash_line = trash_line
+        self.move_status = move_status
         self.expunged = False
+        self.uid_expunged = None
+        self.moves = []
         self.selected = None
         self.readonly = None
 
@@ -47,6 +57,9 @@ class FakeIMAP:
         self.selected = folder
         self.readonly = readonly
         return ("OK", [b"1 EXISTS"])
+
+    def list(self):
+        return ("OK", [self.trash_line])
 
     def expunge(self):
         self.expunged = True
@@ -63,6 +76,12 @@ class FakeIMAP:
             return (self.copy_status, None)
         if cmd == "STORE":
             self.stored = (args[0], args[1], args[2])
+            return ("OK", None)
+        if cmd == "MOVE":
+            self.moves.append((args[0], args[1]))
+            return (self.move_status, None)
+        if cmd == "EXPUNGE":
+            self.uid_expunged = args[0]
             return ("OK", None)
         if cmd == "FETCH":
             uid_arg = args[0]
@@ -176,30 +195,60 @@ def test_download_plain_name_still_works(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# F-3: delete_email must not escalate a failed Trash copy to permanent deletion
+# F-3: delete_email must not escalate a failed Trash operation to permanent
+# deletion, and must find the real (possibly localized) Trash folder
 # ---------------------------------------------------------------------------
 
 def test_delete_without_trash_folder_raises_and_keeps_message(monkeypatch):
-    conn = FakeIMAP(copy_status="NO", deleted_ids=[])
+    # No folder advertises \Trash on this mailbox
+    conn = FakeIMAP(trash_line=b'(\\HasNoChildren) NIL "SomeFolder"')
+    monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+
+    with pytest.raises(Exception, match="Trash folder not found"):
+        server.delete_email("INBOX", "1")
+    assert conn.expunged is False
+    assert conn.moves == []
+
+
+def test_delete_moves_to_trash_discovered_via_special_use_flag(monkeypatch):
+    # Yandex in a Russian-UI account: the trash is named "Удаленные" (UTF-7)
+    conn = FakeIMAP(
+        trash_line=b'(\\HasNoChildren \\Trash) NIL "&BCMENAQwBDsENQQ9BD0ESwQ1-"',
+        deleted_ids=["1"],
+    )
+    monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+
+    result = server.delete_email("INBOX", "1")
+    assert result["status"] == "moved_to_trash"
+    assert result["trash_folder"] == "&BCMENAQwBDsENQQ9BD0ESwQ1-"
+    # Atomic UID MOVE, not COPY/STORE/EXPUNGE
+    assert conn.moves == [("1", "&BCMENAQwBDsENQQ9BD0ESwQ1-")]
+    assert conn.expunged is False
+
+
+def test_delete_fallback_copy_failure_raises_and_keeps_message(monkeypatch):
+    conn = FakeIMAP(copy_status="NO", deleted_ids=[], capabilities=("UIDPLUS",))
     monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
 
     with pytest.raises(Exception, match="Could not move email to Trash"):
         server.delete_email("INBOX", "1")
     assert conn.expunged is False
-    assert conn.copied == ("1", "Trash")
 
 
-def test_delete_success_path_expunges_only_requested_message(monkeypatch):
-    conn = FakeIMAP(copy_status="OK", deleted_ids=["1"])
+def test_delete_fallback_scoped_uid_expunge(monkeypatch):
+    # Server without MOVE but with UIDPLUS: UID EXPUNGE removes exactly the
+    # requested message, no collateral sweep possible
+    conn = FakeIMAP(capabilities=("UIDPLUS",), deleted_ids=["1", "2"])
     monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
 
     result = server.delete_email("INBOX", "1")
     assert result["status"] == "moved_to_trash"
-    assert conn.expunged is True
+    assert conn.uid_expunged == "1"
+    assert conn.expunged is False
 
 
-def test_delete_skips_expunge_when_other_messages_pending(monkeypatch):
-    conn = FakeIMAP(copy_status="OK", deleted_ids=["1", "2"])
+def test_delete_fallback_skips_expunge_when_other_messages_pending(monkeypatch):
+    conn = FakeIMAP(capabilities=(), deleted_ids=["1", "2"])
     monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
 
     result = server.delete_email("INBOX", "1")
@@ -207,12 +256,31 @@ def test_delete_skips_expunge_when_other_messages_pending(monkeypatch):
     assert conn.expunged is False
 
 
+def test_delete_fallback_expunges_when_only_requested_message_flagged(monkeypatch):
+    conn = FakeIMAP(capabilities=(), deleted_ids=["1"])
+    monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+
+    result = server.delete_email("INBOX", "1")
+    assert result["status"] == "moved_to_trash"
+    assert conn.expunged is True
+
+
 # ---------------------------------------------------------------------------
 # F-4: move_email unscoped EXPUNGE
 # ---------------------------------------------------------------------------
 
-def test_move_skips_expunge_when_other_messages_pending(monkeypatch):
-    conn = FakeIMAP(deleted_ids=["1", "2"])
+def test_move_uses_atomic_uid_move_when_supported(monkeypatch):
+    conn = FakeIMAP()
+    monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+
+    result = server.move_email("INBOX", "1", "Archive")
+    assert result["status"] == "moved"
+    assert conn.moves == [("1", "Archive")]
+    assert conn.expunged is False
+
+
+def test_move_fallback_skips_expunge_when_other_messages_pending(monkeypatch):
+    conn = FakeIMAP(capabilities=(), deleted_ids=["1", "2"])
     monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
 
     result = server.move_email("INBOX", "1", "Archive")
@@ -220,8 +288,8 @@ def test_move_skips_expunge_when_other_messages_pending(monkeypatch):
     assert conn.expunged is False
 
 
-def test_move_expunges_when_only_requested_message_flagged(monkeypatch):
-    conn = FakeIMAP(deleted_ids=["1"])
+def test_move_fallback_expunges_when_only_requested_message_flagged(monkeypatch):
+    conn = FakeIMAP(capabilities=(), deleted_ids=["1"])
     monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
 
     result = server.move_email("INBOX", "1", "Archive")

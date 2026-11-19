@@ -146,6 +146,34 @@ _MAILBOX_LIST_RE = re.compile(
 )
 
 
+def _find_folder_by_flag(conn, flag: str):
+    """Find a mailbox whose LIST flags contain `flag` (e.g. "\\Trash").
+
+    Standard folders are localized by the account's interface language
+    (Yandex: "Trash" in English UI, "Удаленные" in Russian UI), so the name
+    must never be hardcoded: RFC6154 special-use attributes identify the
+    folder on any locale. Returns the raw IMAP mailbox name or None.
+    """
+    status, data = conn.list()
+    if status != "OK":
+        return None
+    for item in data or ():
+        line = item.decode("utf-8", errors="replace") if isinstance(item, bytes) else item
+        match = _MAILBOX_LIST_RE.match(line)
+        if not match:
+            continue
+        flags = match.group("flags").split()
+        if flag in flags:
+            imap_name = _unquote_imap_string(match.group("name"))
+            if imap_name:
+                return imap_name
+    return None
+
+
+def _supports(conn, capability: str) -> bool:
+    return capability in tuple(getattr(conn, "capabilities", ()) or ())
+
+
 def _unquote_imap_string(value: str) -> str:
     """Unquote an IMAP quoted string and unescape \\\\ and \\\" sequences."""
     if not (value.startswith('"') and value.endswith('"') and len(value) >= 2):
@@ -589,7 +617,20 @@ def move_email(folder: str, email_id: str, destination: str) -> dict:
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
-        # Copy to destination
+        # Atomic server-side move (RFC 6851): no COPY/STORE/EXPUNGE dance,
+        # so nothing can end up duplicated and no expunge can sweep others.
+        if _supports(conn, "MOVE"):
+            status, _ = conn.uid("MOVE", uid, destination)
+            if status != "OK":
+                raise Exception(f"Failed to move email to: {destination}")
+            return {
+                "status": "moved",
+                "email_id": email_id,
+                "from_folder": folder,
+                "to_folder": destination
+            }
+
+        # Fallback: COPY + flag + scoped expunge
         status, _ = conn.uid("COPY", uid, destination)
         if status != "OK":
             raise Exception(f"Failed to copy email to: {destination}")
@@ -626,22 +667,45 @@ def delete_email(folder: str, email_id: str) -> dict:
     """
     Delete an email (move to Trash).
 
+    The Trash folder is discovered via the RFC6154 special-use attribute
+    \\Trash, so it works on any account locale (Yandex names it "Удаленные"
+    in Russian-UI accounts, "Trash" in English-UI ones). When the server
+    supports MOVE, the delete is an atomic UID MOVE; otherwise COPY + flag
+    with a scoped expunge.
+
     Args:
         folder: Folder containing the email
-        email_id: Email ID to delete
+        email_id: Email UID to delete
 
     Returns confirmation of deletion.
     """
     uid = _require_uid(email_id)
-    # Yandex uses "Trash" folder (may also be localized)
-    trash_folder = "Trash"
 
     with imap_connection() as conn:
         status, _ = conn.select(folder)
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
-        # Try to move to Trash
+        # Discover the real Trash folder; never hardcode a localized name
+        trash_folder = _find_folder_by_flag(conn, "\\Trash")
+        if trash_folder is None:
+            # Fail safely: leave the message in place rather than risk
+            # permanent deletion when the trash folder cannot be identified.
+            raise Exception("Trash folder not found (no \\Trash attribute); email left in place")
+
+        # Atomic server-side move (RFC 6851) when available
+        if _supports(conn, "MOVE"):
+            status, _ = conn.uid("MOVE", uid, trash_folder)
+            if status != "OK":
+                raise Exception(f"Could not move email to {trash_folder}; email left in place")
+            return {
+                "status": "moved_to_trash",
+                "email_id": email_id,
+                "folder": folder,
+                "trash_folder": trash_folder
+            }
+
+        # Fallback: COPY + flag + scoped expunge
         status, _ = conn.uid("COPY", uid, trash_folder)
         if status != "OK":
             # Failing to reach Trash must never escalate to permanent deletion:
@@ -653,9 +717,21 @@ def delete_email(folder: str, email_id: str) -> dict:
         if status != "OK":
             raise Exception("Failed to mark original as deleted")
 
-        # IMAP EXPUNGE is folder-wide: only expunge when no OTHER messages are
-        # pending deletion (they would be swept as a side effect). UIDs make
-        # this comparison stable regardless of concurrent renumbering.
+        # UID EXPUNGE (UIDPLUS) removes exactly the requested message
+        if _supports(conn, "UIDPLUS"):
+            status, _ = conn.uid("EXPUNGE", uid)
+            if status != "OK":
+                raise Exception("Failed to expunge the deleted message")
+            return {
+                "status": "moved_to_trash",
+                "email_id": email_id,
+                "folder": folder,
+                "trash_folder": trash_folder
+            }
+
+        # Last resort: IMAP EXPUNGE is folder-wide, so only expunge when no
+        # OTHER messages are pending deletion (they would be swept as a side
+        # effect). UIDs keep this comparison stable across renumbering.
         status, deleted = conn.uid("SEARCH", "DELETED")
         flagged = deleted[0].split() if status == "OK" and deleted and deleted[0] else []
         if flagged != [uid.encode()]:

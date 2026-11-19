@@ -181,8 +181,8 @@ class TestUidOperations:
 
         result = server.delete_email("INBOX", "42")
         assert result["status"] == "moved_to_trash"
-        assert conn.expunged is True
-        assert conn.copied == ("42", "Trash")
+        assert conn.expunged is False
+        assert conn.moves == [("42", "Trash")]
 
     def test_non_numeric_email_id_rejected_before_any_command(self, monkeypatch):
         conn = FakeIMAP()
@@ -203,7 +203,10 @@ class TestUidOperations:
 # ---------------------------------------------------------------------------
 
 class FakeStoreConn(FakeIMAP):
+    """Fallback-path connection (no MOVE) with a failing uid STORE."""
+
     def __init__(self, *a, store_status="OK", **kw):
+        kw.setdefault("capabilities", ("UIDPLUS",))
         super().__init__(*a, **kw)
         self.store_status = store_status
 
