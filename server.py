@@ -16,9 +16,7 @@ import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
-from email.utils import parsedate_to_datetime
 import os
-import sys
 import logging
 from pathlib import Path
 from contextlib import contextmanager
@@ -496,6 +494,7 @@ def search_emails(
 
 
 @mcp.tool()
+@tool_with_resilience
 def read_email(folder: str, email_id: str) -> EmailFull:
     """
     Read full email content by ID.
@@ -707,6 +706,7 @@ def send_email(
 
 
 @mcp.tool()
+@tool_with_resilience
 def move_email(folder: str, email_id: str, destination: str) -> MoveResult:
     """
     Move an email to another folder.
@@ -770,6 +770,7 @@ def move_email(folder: str, email_id: str, destination: str) -> MoveResult:
 
 
 @mcp.tool()
+@tool_with_resilience
 def delete_email(folder: str, email_id: str) -> DeleteResult:
     """
     Delete an email (move to Trash).
@@ -845,14 +846,16 @@ def delete_email(folder: str, email_id: str) -> DeleteResult:
             return {
                 "status": "moved_to_trash_flag_not_expunged",
                 "email_id": email_id,
-                "folder": folder
+                "folder": folder,
+                "trash_folder": trash_folder
             }
         conn.expunge()
 
         return {
             "status": "moved_to_trash",
             "email_id": email_id,
-            "folder": folder
+            "folder": folder,
+            "trash_folder": trash_folder
         }
 
 

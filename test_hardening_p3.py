@@ -124,3 +124,99 @@ class TestInvocationLogging:
                 folder="I" * 500, query="ALL", limit=2)
 
         assert "…" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Output-schema conformance: every return path must satisfy its TypedDict,
+# otherwise FastMCP rejects the result AFTER the side effect has happened
+# (the SendResult cc/bcc bug class).
+# ---------------------------------------------------------------------------
+
+import typing
+from pydantic import TypeAdapter
+
+_ADAPTERS = {
+    name: TypeAdapter(getattr(server, name))
+    for name in ("FolderInfo", "EmailSummary", "EmailFull", "SendResult",
+                 "DownloadResult", "MoveResult", "DeleteResult")
+}
+
+
+class TestOutputSchemaConformance:
+    def test_all_tools_are_resilience_wrapped(self):
+        # regression: the scripted patch left read/move/delete unwrapped
+        for tool in ("list_folders", "search_emails", "read_email",
+                     "download_attachment", "send_email", "move_email", "delete_email"):
+            assert hasattr(getattr(server, tool), "__wrapped__"), f"{tool} misses resilience"
+
+    def test_delete_email_all_return_paths_match_schema(self, monkeypatch):
+        from test_security_fixes import make_stubbed_connection
+        adapter = _ADAPTERS["DeleteResult"]
+
+        # MOVE path
+        conn = FakeIMAPForSchema()
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+        r = server.delete_email("INBOX", "1")
+        adapter.validate_python(r)
+
+        # fallback UID EXPUNGE path (no MOVE, UIDPLUS present)
+        conn = FakeIMAPForSchema(capabilities=("UIDPLUS",))
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+        r = server.delete_email("INBOX", "1")
+        adapter.validate_python(r)
+
+        # last-resort expunge path (no MOVE, no UIDPLUS, only this message flagged)
+        conn = FakeIMAPForSchema(capabilities=())
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+        r = server.delete_email("INBOX", "1")
+        adapter.validate_python(r)
+
+        # flag_not_expunged path (another message is pending deletion)
+        conn = FakeIMAPForSchema(capabilities=(), deleted_ids=["1", "2"])
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+        r = server.delete_email("INBOX", "1")
+        adapter.validate_python(r)
+
+    def test_move_email_all_return_paths_match_schema(self, monkeypatch):
+        from test_security_fixes import make_stubbed_connection
+        adapter = _ADAPTERS["MoveResult"]
+
+        conn = FakeIMAPForSchema()
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+        adapter.validate_python(server.move_email("INBOX", "1", "Archive"))
+
+        conn = FakeIMAPForSchema(capabilities=(), deleted_ids=["1", "2"])
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+        adapter.validate_python(server.move_email("INBOX", "1", "Archive"))
+
+        conn = FakeIMAPForSchema(capabilities=(), deleted_ids=["1"])
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+        adapter.validate_python(server.move_email("INBOX", "1", "Archive"))
+
+    def test_send_email_without_cc_bcc_matches_schema(self, monkeypatch):
+        adapter = _ADAPTERS["SendResult"]
+        adapter.validate_python({"status": "sent", "to": "x@y.z", "subject": "s",
+                                 "cc": None, "bcc": None})
+
+
+class FakeIMAPForSchema:
+    """Minimal connection stub for schema-conformance tests (Yandex-like caps)."""
+
+    def __init__(self, capabilities=("UIDPLUS", "MOVE"), deleted_ids=None):
+        self.capabilities = tuple(capabilities)
+        self.deleted_ids = list(deleted_ids or [])
+
+    def select(self, folder, readonly=False):
+        return ("OK", [b"1 EXISTS"])
+
+    def list(self):
+        return ("OK", [b'(\\HasNoChildren \\Trash) NIL "Trash"'])
+
+    def expunge(self):
+        return ("OK", [b"1"])
+
+    def uid(self, command, *args):
+        cmd = command.upper()
+        if cmd == "SEARCH":
+            return ("OK", [" ".join(self.deleted_ids).encode()])
+        return ("OK", None)
