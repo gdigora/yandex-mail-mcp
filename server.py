@@ -8,6 +8,7 @@ Uses IMAP for reading and SMTP for sending.
 import imaplib
 import smtplib
 import email
+import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
@@ -42,6 +43,12 @@ SMTP_PORT = 587
 EMAIL = os.getenv("YANDEX_EMAIL")
 PASSWORD = os.getenv("YANDEX_APP_PASSWORD")
 
+# TLS context that verifies the server certificate chain and hostname.
+# Without an explicit context, stdlib imaplib/smtplib default to
+# ssl._create_stdlib_context() (CERT_NONE), letting any network-path attacker
+# with a self-signed certificate capture the app password.
+_TLS_CONTEXT = ssl.create_default_context()
+
 # Create MCP server
 mcp = FastMCP("Yandex Mail")
 
@@ -63,13 +70,28 @@ def decode_mime_header(header_value: str) -> str:
     return "".join(decoded_parts)
 
 
+def decode_body(payload, charset: str) -> str:
+    """Decode an email body with the same guarded fallback as decode_mime_header.
+
+    Remote senders control the Content-Type charset parameter; an unknown codec
+    name must never crash the tool call (audit finding: uncaught LookupError).
+    """
+    payload = payload or b""
+    for cs in (charset or "utf-8", "utf-8"):
+        try:
+            return payload.decode(cs, errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return payload.decode("utf-8", errors="replace")
+
+
 @contextmanager
 def imap_connection():
     """Context manager for IMAP connection."""
     if not EMAIL or not PASSWORD:
         raise ValueError("YANDEX_EMAIL and YANDEX_APP_PASSWORD must be set in .env")
 
-    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, ssl_context=_TLS_CONTEXT)
     try:
         conn.login(EMAIL, PASSWORD)
         yield conn
@@ -88,7 +110,7 @@ def smtp_connection():
 
     conn = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
     try:
-        conn.starttls()
+        conn.starttls(context=_TLS_CONTEXT)
         conn.login(EMAIL, PASSWORD)
         yield conn
     finally:
@@ -294,18 +316,18 @@ def read_email(folder: str, email_id: str) -> dict:
                 elif content_type == "text/plain" and not body_text:
                     payload = part.get_payload(decode=True)
                     charset = part.get_content_charset() or "utf-8"
-                    body_text = payload.decode(charset, errors="replace")
+                    body_text = decode_body(payload, charset)
                 elif content_type == "text/html" and not body_html:
                     payload = part.get_payload(decode=True)
                     charset = part.get_content_charset() or "utf-8"
-                    body_html = payload.decode(charset, errors="replace")
+                    body_html = decode_body(payload, charset)
         else:
             payload = msg.get_payload(decode=True)
             charset = msg.get_content_charset() or "utf-8"
             if msg.get_content_type() == "text/html":
-                body_html = payload.decode(charset, errors="replace")
+                body_html = decode_body(payload, charset)
             else:
-                body_text = payload.decode(charset, errors="replace")
+                body_text = decode_body(payload, charset)
 
         return {
             "id": email_id,
@@ -370,9 +392,19 @@ def download_attachment(
                     # Found the attachment
                     payload = part.get_payload(decode=True)
                     if payload:
-                        # Save to file
-                        file_path = save_path / decoded_filename
-                        with open(file_path, "wb") as f:
+                        # Confine the write to the save directory: reduce the
+                        # (remote-controlled) attachment name to a safe basename,
+                        # resolve the final path under save_dir, and never follow
+                        # symlinks (audit finding: path traversal / overwrite).
+                        base = os.path.basename(decoded_filename.replace("\\", "/"))
+                        if not base or base in (".", "..") or base.startswith("."):
+                            raise ValueError(f"Unsafe attachment filename: {decoded_filename!r}")
+                        root = save_path.resolve()
+                        file_path = (root / base).resolve()
+                        if os.path.commonpath([str(root), str(file_path)]) != str(root):
+                            raise ValueError("Resolved path escapes save_dir")
+                        fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+                        with os.fdopen(fd, "wb") as f:
                             f.write(payload)
 
                         return {
@@ -469,7 +501,17 @@ def move_email(folder: str, email_id: str, destination: str) -> dict:
         if status != "OK":
             raise Exception("Failed to mark original as deleted")
 
-        # Expunge to actually delete
+        # IMAP EXPUNGE is folder-wide: only expunge when no OTHER messages are
+        # pending deletion (they would be swept as a side effect).
+        status, deleted = conn.search(None, "DELETED")
+        flagged = deleted[0].split() if status == "OK" and deleted and deleted[0] else []
+        if flagged != [email_id.encode()]:
+            return {
+                "status": "moved_copy_created_flag_not_expunged",
+                "email_id": email_id,
+                "from_folder": folder,
+                "to_folder": destination
+            }
         conn.expunge()
 
         return {
@@ -502,19 +544,23 @@ def delete_email(folder: str, email_id: str) -> dict:
         # Try to move to Trash
         status, _ = conn.copy(email_id.encode(), trash_folder)
         if status != "OK":
-            # If Trash doesn't work, try marking as deleted
-            status, _ = conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
-            if status != "OK":
-                raise Exception("Failed to delete email")
-            conn.expunge()
-            return {
-                "status": "deleted_permanently",
-                "email_id": email_id,
-                "folder": folder
-            }
+            # Failing to reach Trash must never escalate to permanent deletion:
+            # fail safely and leave the message untouched.
+            raise Exception(f"Could not move email to {trash_folder}; email left in place")
 
         # Mark original as deleted
         conn.store(email_id.encode(), "+FLAGS", "\\Deleted")
+
+        # IMAP EXPUNGE is folder-wide: only expunge when no OTHER messages are
+        # pending deletion (they would be swept as a side effect).
+        status, deleted = conn.search(None, "DELETED")
+        flagged = deleted[0].split() if status == "OK" and deleted and deleted[0] else []
+        if flagged != [email_id.encode()]:
+            return {
+                "status": "moved_to_trash_flag_not_expunged",
+                "email_id": email_id,
+                "folder": folder
+            }
         conn.expunge()
 
         return {
