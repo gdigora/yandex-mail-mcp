@@ -17,7 +17,7 @@ import email.mime.text
 import pytest
 
 import server
-from test_security_fixes import FakeIMAP, make_stubbed_connection
+from test_security_fixes import FakeIMAP, make_body_email, make_stubbed_connection
 
 
 # ---------------------------------------------------------------------------
@@ -230,3 +230,64 @@ def test_move_failed_store_raises(monkeypatch):
     with pytest.raises(Exception, match="Failed to mark original as deleted"):
         server.move_email("INBOX", "1", "Archive")
     assert conn.expunged is False
+
+
+# ---------------------------------------------------------------------------
+# P2: provenance markers and limit clamping
+# ---------------------------------------------------------------------------
+
+class FakeSearchConn:
+    """Search-only connection returning a configurable uid list."""
+
+    def __init__(self, uids):
+        self.uids = list(uids)
+
+    def select(self, folder, readonly=False):
+        return ("OK", [b"1 EXISTS"])
+
+    def uid(self, command, *args):
+        if command.upper() == "SEARCH":
+            return ("OK", [" ".join(self.uids).encode()])
+        if command.upper() == "FETCH":
+            uid = args[0].decode() if isinstance(args[0], bytes) else args[0]
+            msg = email.mime.text.MIMEText(f"body {uid}", "plain", "utf-8")
+            return ("OK", [(None, msg.as_bytes())])
+        raise AssertionError(command)
+
+
+def _run_search(monkeypatch, uids, **kwargs):
+    conn = FakeSearchConn(uids)
+    monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+    return server.search_emails(**kwargs)
+
+
+def test_search_summaries_carry_provenance(monkeypatch):
+    emails = _run_search(monkeypatch, ["1", "2"], folder="INBOX", query="ALL", limit=10)
+    assert all(e["provenance"] == "untrusted_remote" for e in emails)
+
+
+def test_read_email_return_carries_provenance(monkeypatch):
+    conn = FakeIMAP(messages={"1": make_body_email("utf-8")})
+    monkeypatch.setattr(server, "imap_connection", make_stubbed_connection(conn))
+
+    result = server.read_email("INBOX", "1")
+    assert result["provenance"] == "untrusted_remote"
+
+
+def test_nonpositive_limit_uses_default_20(monkeypatch):
+    emails = _run_search(monkeypatch, [str(i) for i in range(1, 31)], folder="INBOX", query="ALL", limit=0)
+    assert len(emails) == 20
+    # Most recent (highest uid) first, truncated from the top of the list
+    assert emails[0]["id"] == "30"
+
+
+def test_limit_capped_at_500(monkeypatch):
+    emails = _run_search(monkeypatch, [str(i) for i in range(1, 601)], folder="INBOX", query="ALL", limit=2000)
+    assert len(emails) == 500
+    assert emails[0]["id"] == "600"
+
+
+def test_normal_limit_still_respected(monkeypatch):
+    emails = _run_search(monkeypatch, [str(i) for i in range(1, 31)], folder="INBOX", query="ALL", limit=3)
+    assert len(emails) == 3
+    assert emails[0]["id"] == "30"
