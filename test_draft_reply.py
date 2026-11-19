@@ -203,3 +203,42 @@ class TestDraftResultSchema:
         for tool in ("list_folders", "search_emails", "read_email", "download_attachment",
                      "send_email", "move_email", "delete_email", "create_draft", "reply_email"):
             assert hasattr(getattr(server, tool), "__wrapped__"), f"{tool} misses resilience"
+
+
+class TestFetchGuards:
+    """A nonexistent/vanished UID must raise a clean "not found" error
+    instead of crashing on NoneType subscript (found live)."""
+
+    def test_read_email_missing_uid_raises_cleanly(self, monkeypatch):
+        conn = FakeDraftIMAP(messages={})
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+        with pytest.raises(Exception, match="not found in INBOX"):
+            server.read_email("INBOX", "999999")
+
+    def test_reply_email_missing_uid_raises_cleanly(self, monkeypatch):
+        conn = FakeDraftIMAP(messages={})
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+        with pytest.raises(Exception, match="not found in INBOX"):
+            server.reply_email("INBOX", "999999", "ответ")
+
+    def test_download_attachment_missing_uid_raises_cleanly(self, monkeypatch):
+        conn = FakeDraftIMAP(messages={})
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(conn))
+        with pytest.raises(Exception, match="not found in INBOX"):
+            server.download_attachment("INBOX", "999999", "f.txt", "/tmp")
+
+    def test_search_skips_vanished_messages(self, monkeypatch):
+        class VanishingConn(FakeDraftIMAP):
+            def uid(self, command, *args):
+                if command.upper() == "SEARCH":
+                    return ("OK", [b"1 2 3"])
+                if command.upper() == "FETCH":
+                    uid = args[0].decode() if isinstance(args[0], bytes) else args[0]
+                    if uid == "2":  # vanished between SEARCH and FETCH
+                        return ("OK", [None])
+                    return ("OK", [(None, email.mime.text.MIMEText(f"body {uid}", "plain", "utf-8").as_bytes())])
+                return super().uid(command, *args)
+
+        monkeypatch.setattr(server, "imap_connection", make_stubbed_draft_connection(VanishingConn()))
+        emails = server.search_emails("INBOX", "ALL", 10)
+        assert [e["id"] for e in emails] == ["3", "1"]  # "2" skipped, most recent first

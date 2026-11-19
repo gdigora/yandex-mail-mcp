@@ -476,8 +476,8 @@ def search_emails(
         for msg_id in ids:
             # Fetch headers only for performance
             status, msg_data = conn.uid("FETCH", msg_id, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])")
-            if status != "OK":
-                continue
+            if status != "OK" or not msg_data or not msg_data[0] or msg_data[0][1] is None:
+                continue  # message vanished between SEARCH and FETCH
 
             raw_header = msg_data[0][1]
             msg = email.message_from_bytes(raw_header)
@@ -515,11 +515,7 @@ def read_email(folder: str, email_id: str) -> EmailFull:
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
-        status, msg_data = conn.uid("FETCH", email_id, "(RFC822)")
-        if status != "OK":
-            raise Exception(f"Failed to fetch email: {email_id}")
-
-        raw_email = msg_data[0][1]
+        raw_email = _fetch_raw_email(conn, email_id, folder)
         msg = email.message_from_bytes(raw_email)
 
         subject = decode_mime_header(msg.get("Subject", ""))
@@ -606,11 +602,7 @@ def download_attachment(
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
-        status, msg_data = conn.uid("FETCH", email_id, "(RFC822)")
-        if status != "OK":
-            raise Exception(f"Failed to fetch email: {email_id}")
-
-        raw_email = msg_data[0][1]
+        raw_email = _fetch_raw_email(conn, email_id, folder)
         msg = email.message_from_bytes(raw_email)
 
         # Find the attachment
@@ -863,6 +855,19 @@ def delete_email(folder: str, email_id: str) -> DeleteResult:
         }
 
 
+def _fetch_raw_email(conn, uid: str, folder: str) -> bytes:
+    """UID FETCH (RFC822) with a guard: a nonexistent/vanished UID returns
+    OK with [None] on real servers - treat that as "not found" instead of
+    crashing on NoneType subscript (found live: reply_email to a UID that
+    was removed from the folder between search and reply)."""
+    status, msg_data = conn.uid("FETCH", uid, "(RFC822)")
+    if status != "OK":
+        raise Exception(f"Failed to fetch email: {uid}")
+    if not msg_data or not msg_data[0] or msg_data[0][1] is None:
+        raise Exception(f"Email {uid} not found in {folder}")
+    return msg_data[0][1]
+
+
 def _append_draft(conn, msg) -> dict:
     """APPEND a composed message into the mailbox's \\Drafts folder.
 
@@ -962,11 +967,7 @@ def reply_email(folder: str, email_id: str, body: str) -> DraftResult:
         if status != "OK":
             raise Exception(f"Failed to select folder: {folder}")
 
-        status, msg_data = conn.uid("FETCH", uid, "(RFC822)")
-        if status != "OK":
-            raise Exception(f"Failed to fetch email: {email_id}")
-
-        original = email.message_from_bytes(msg_data[0][1])
+        original = email.message_from_bytes(_fetch_raw_email(conn, uid, folder))
         subject = decode_mime_header(original.get("Subject", ""))
         if not subject.lower().startswith("re"):
             subject = "Re: " + subject

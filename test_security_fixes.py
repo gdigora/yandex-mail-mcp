@@ -88,7 +88,10 @@ class FakeIMAP:
             if isinstance(uid_arg, (bytes, bytearray)):
                 uid_arg = uid_arg.decode()
             raw = self.messages.get(uid_arg)
-            return ("OK", [(None, raw)] if raw is not None else ("OK", [(None, b"")]))
+            # real imaplib returns OK with [None] for a nonexistent UID
+            if raw is not None:
+                return ("OK", [(None, raw)])
+            return ("OK", [None])
         raise AssertionError(f"unexpected uid command: {cmd}")
 
 
