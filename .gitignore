@@ -1,7 +1,16 @@
+# Local secrets and credentials
 .env
+.env.local
+credentials.json
+*.pem
+*.key
+
+# Python artifacts
 .venv/
 __pycache__/
 *.pyc
-*.log
 .pytest_cache/
+
+# Logs and OS files
+*.log
 .DS_Store
