@@ -386,6 +386,39 @@ def download_attachment(
         raise Exception(f"Attachment not found: {filename}")
 
 
+
+def _find_sent_folder(conn) -> Optional[str]:
+    """Return the IMAP name of the folder flagged \\Sent, or None."""
+    status, folder_data = conn.list()
+    if status != "OK":
+        return None
+    for item in folder_data:
+        if not isinstance(item, bytes):
+            continue
+        decoded = item.decode("utf-8", errors="replace")
+        if "\\Sent" not in decoded:
+            continue
+        parts = decoded.rsplit('"', 2)
+        if len(parts) >= 2:
+            return parts[-2]
+    return None
+
+
+def _append_sent_copy(conn, msg) -> str:
+    """Append a copy of the sent message to the \\Sent folder.
+
+    Returns the folder name. Raises on failure; callers in the tool wrapper
+    catch and log (the email is already sent at this point).
+    """
+    sent_folder = _find_sent_folder(conn)
+    if sent_folder is None:
+        raise Exception("Sent folder not found (no \\Sent attribute)")
+    status, _ = conn.append(sent_folder, "\\Seen", None, msg.as_bytes())
+    if status != "OK":
+        raise Exception(f"Failed to append sent copy to {sent_folder}")
+    return sent_folder
+
+
 @mcp.tool()
 def send_email(
     to: str,
@@ -393,7 +426,8 @@ def send_email(
     body: str,
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
-    html: bool = False
+    html: bool = False,
+    save_copy: bool = True
 ) -> dict:
     """
     Send an email via Yandex SMTP.
@@ -405,6 +439,7 @@ def send_email(
         cc: CC recipients (optional, comma-separated)
         bcc: BCC recipients (optional, comma-separated)
         html: If True, body is treated as HTML (default: False)
+        save_copy: If True, also save a copy into the Sent folder (default: True)
 
     Returns confirmation with message ID.
     """
@@ -433,12 +468,22 @@ def send_email(
     with smtp_connection() as conn:
         conn.send_message(msg, EMAIL, recipients)
 
+    sent_copy = None
+    if save_copy:
+        try:
+            with imap_connection() as conn:
+                sent_copy = _append_sent_copy(conn, msg)
+        except Exception:
+            # The email is already sent; a copy failure must not break the result.
+            logger.exception("Failed to save sent copy to Sent folder")
+
     return {
         "status": "sent",
         "to": to,
         "subject": subject,
         "cc": cc,
-        "bcc": bcc
+        "bcc": bcc,
+        "sent_copy": sent_copy
     }
 
 
